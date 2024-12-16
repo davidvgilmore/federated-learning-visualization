@@ -2,73 +2,132 @@ mod coordinator;
 mod model;
 mod worker;
 
-use ndarray::{Array2, arr2};
-use crate::worker::Worker;
+use axum::{
+    routing::{get, post},
+    Router, Json, extract::State,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use std::collections::HashMap;
+use tracing_subscriber;
 
-fn main() {
-    // Test data for worker 1
-    let data1 = arr2(&[
-        [1.0, 2.0],
-        [2.0, 4.0],
-        [3.0, 6.0],
-    ]);
-    let labels1 = arr2(&[
-        [3.0],
-        [6.0],
-        [9.0],
-    ]);
+// API Types
+#[derive(Serialize)]
+struct TrainingStatus {
+    current_epoch: i32,
+    worker_losses: HashMap<String, f32>,
+    global_loss: Option<f32>,
+    active_workers: Vec<String>,
+}
 
-    // Test data for worker 2
-    let data2 = arr2(&[
-        [2.0, 4.0],
-        [3.0, 6.0],
-        [4.0, 8.0],
-    ]);
-    let labels2 = arr2(&[
-        [6.0],
-        [9.0],
-        [12.0],
-    ]);
+#[derive(Deserialize)]
+struct WorkerUpdate {
+    worker_id: String,
+    loss: f32,
+    parameters: serde_json::Value,  // Accept any JSON value and validate in coordinator
+}
 
-    // Create workers
-    let mut worker1 = Worker::new(
-        "worker1".to_string(),
-        2,  // input dimension
-        1,  // output dimension
-        data1,
-        labels1,
-    );
+#[derive(Clone)]
+struct AppState {
+    coordinator: Arc<coordinator::Coordinator>,
+    worker_losses: Arc<RwLock<HashMap<String, f32>>>,
+    global_loss: Arc<RwLock<Option<f32>>>,
+}
 
-    let mut worker2 = Worker::new(
-        "worker2".to_string(),
-        2,
-        1,
-        data2,
-        labels2,
-    );
+#[tokio::main]
+async fn main() {
+    // Initialize tracing
+    tracing_subscriber::fmt::init();
 
-    // Train for a few epochs
-    println!("Training worker 1:");
-    for epoch in 0..5 {
-        let loss = worker1.train_epoch(0.01);
-        println!("Epoch {}: Loss = {}", epoch, loss);
-    }
+    // Create coordinator with 2D input and 1D output
+    let coordinator = Arc::new(coordinator::Coordinator::new(2, 1));
+    
+    let app_state = AppState {
+        coordinator,
+        worker_losses: Arc::new(RwLock::new(HashMap::new())),
+        global_loss: Arc::new(RwLock::new(None)),
+    };
 
-    println!("\nTraining worker 2:");
-    for epoch in 0..5 {
-        let loss = worker2.train_epoch(0.01);
-        println!("Epoch {}: Loss = {}", epoch, loss);
-    }
+    // Build our application with routes
+    let app = Router::new()
+        .route("/status", get(get_status))
+        .route("/register_worker", post(register_worker))
+        .route("/submit_update", post(submit_update))
+        .with_state(app_state);
 
-    // Serialize and deserialize test
-    match worker1.get_model_parameters() {
-        Ok(params) => {
-            println!("\nModel parameters serialization successful");
-            match worker2.update_model(&params) {
-                Ok(_) => println!("Model parameters update successful"),
-                Err(e) => println!("Error updating model parameters: {}", e),
+    // Run it
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
+        .await
+        .unwrap();
+    println!("Listening on {}", listener.local_addr().unwrap());
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn get_status(
+    State(state): State<AppState>,
+) -> Json<TrainingStatus> {
+    let current_epoch = *state.coordinator.current_epoch.read().await;
+    let worker_losses = state.worker_losses.read().await.clone();
+    let global_loss = *state.global_loss.read().await;
+    let workers = state.coordinator.workers.read().await;
+    let active_workers = workers.keys().cloned().collect();
+
+    Json(TrainingStatus {
+        current_epoch,
+        worker_losses,
+        global_loss,
+        active_workers,
+    })
+}
+
+async fn register_worker(
+    State(state): State<AppState>,
+    Json(payload): Json<serde_json::Value>,
+) -> Json<serde_json::Value> {
+    let worker_id = payload["worker_id"].as_str().unwrap().to_string();
+    let data_size = payload["data_size"].as_u64().unwrap() as usize;
+
+    state.coordinator.register_worker(worker_id.clone(), data_size).await;
+
+    Json(serde_json::json!({
+        "status": "success",
+        "message": format!("Worker {} registered", worker_id)
+    }))
+}
+
+async fn submit_update(
+    State(state): State<AppState>,
+    Json(update): Json<WorkerUpdate>,
+) -> Json<serde_json::Value> {
+    let current_epoch = *state.coordinator.current_epoch.read().await;
+    
+    match state.coordinator.submit_update(
+        update.worker_id.clone(),
+        update.parameters,
+        current_epoch,
+    ).await {
+        Ok(()) => {
+            // Update worker loss
+            state.worker_losses.write().await.insert(update.worker_id, update.loss);
+            
+            // Check if we completed an epoch
+            let updates = state.coordinator.updates_this_epoch.read().await;
+            if updates.len() == state.coordinator.workers.read().await.len() {
+                // Calculate and store global loss
+                let total_loss: f32 = state.worker_losses.read().await.values().sum();
+                let avg_loss = total_loss / state.worker_losses.read().await.len() as f32;
+                *state.global_loss.write().await = Some(avg_loss);
             }
+
+            Json(serde_json::json!({
+                "status": "success",
+                "message": "Update accepted"
+            }))
         },
-        Err(e) => println!("Error serializing model parameters: {}", e),
+        Err(e) => Json(serde_json::json!({
+            "status": "error",
+            "message": e
+        }))
     }
 }

@@ -1,4 +1,18 @@
+# Build artifacts
+/target/
+Cargo.lock
+
+# Python virtual environment
 .venv/
 __pycache__/
 *.pyc
+
+# Logs and runtime files
+logs/
+*.log
+.rust_server.pid
+.streamlit.pid
+.workers.pid
+
+# OS-specific files
 .DS_Store

@@ -2,12 +2,14 @@ use crate::model::{LinearModel, federated_averaging};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use ndarray::{Array1, Array2, ArrayBase, OwnedRepr, Dim};
 
+#[derive(Clone)]
 pub struct Coordinator {
-    model: Arc<RwLock<LinearModel>>,
-    workers: Arc<RwLock<HashMap<String, usize>>>,
-    current_epoch: Arc<RwLock<i32>>,
-    updates_this_epoch: Arc<RwLock<HashMap<String, (LinearModel, usize)>>>,
+    pub model: Arc<RwLock<LinearModel>>,
+    pub workers: Arc<RwLock<HashMap<String, usize>>>,
+    pub current_epoch: Arc<RwLock<i32>>,
+    pub updates_this_epoch: Arc<RwLock<HashMap<String, (LinearModel, usize)>>>,
 }
 
 impl Coordinator {
@@ -33,7 +35,7 @@ impl Coordinator {
     pub async fn submit_update(
         &self,
         worker_id: String,
-        parameters: Vec<u8>,
+        parameters: serde_json::Value,
         epoch: i32,
     ) -> Result<(), String> {
         let current_epoch = *self.current_epoch.read().await;
@@ -41,8 +43,32 @@ impl Coordinator {
             return Err("Epoch mismatch".to_string());
         }
 
-        let model = LinearModel::deserialize(&parameters)
+        // Convert JSON parameters to Vec<f64>
+        let params = parameters.as_array()
+            .ok_or("Parameters must be an array")?
+            .iter()
+            .map(|v| v.as_f64().ok_or("Invalid parameter value"))
+            .collect::<Result<Vec<f64>, &str>>()?;
+
+        if params.len() != 3 {  // 2 weights + 1 bias
+            return Err("Parameters must have length 3 (2 weights + 1 bias)".to_string());
+        }
+
+        // Convert f64 to f32 and split into weights and bias
+        let params_f32: Vec<f32> = params.iter().map(|&x| x as f32).collect();
+        
+        // Split parameters into weights and bias
+        let weights_array: ArrayBase<OwnedRepr<f32>, Dim<[usize; 2]>> = 
+            Array2::from_shape_vec((2, 1), params_f32[..2].to_vec())
             .map_err(|e| e.to_string())?;
+        
+        let bias_array: ArrayBase<OwnedRepr<f32>, Dim<[usize; 1]>> = 
+            Array1::from_vec(params_f32[2..].to_vec());
+
+        let model = LinearModel {
+            weights: weights_array,
+            bias: bias_array,
+        };
 
         let worker_data_size = {
             let workers = self.workers.read().await;
